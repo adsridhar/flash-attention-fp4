@@ -280,6 +280,17 @@ def _flash_attn_fwd(
         assert page_table.shape == (batch_size, max_num_pages_per_seq)
         num_pages, page_size = k.shape[:2]
         seqlen_k = num_pages * page_size
+        # Block-scaled (NVFP4/MXFP8) paged KV goes down the TMA path, which
+        # loads one page per n_block and indexes the per-page scale-factor
+        # tensors with the page id. The CUTLASS block-scaled SF layout also
+        # tiles 128 rows, so a per-page SF tensor needs page_size == 128.
+        # The cp.async PagedKVManager path does not gather SFs at all, so
+        # refuse rather than silently return wrong numbers.
+        if any(t is not None for t in (mSFQ, mSFK, mSFV)):
+            assert page_size == 128, (
+                f"Paged KV with block-scaled (NVFP4/MXFP8) inputs requires "
+                f"page_size == 128 (n_block_size), got {page_size}."
+            )
     else:
         num_pages, page_size = None, None
         seqlen_k = k.shape[-3]
@@ -295,9 +306,13 @@ def _flash_attn_fwd(
         and v.dtype == torch.float4_e2m1fn_x2
     )
     if is_fp4_v:
-        # v.shape = (b, h, d, s/2): num_head_kv = h, head_dim_v = d
-        assert v.shape[0] == batch_size and v.shape[3] * 2 == seqlen_k, (
-            f"FP4 V shape {v.shape} must be (b={batch_size}, h, d, s/2={seqlen_k//2})"
+        # v.shape = (b, h, d, s/2): num_head_kv = h, head_dim_v = d.
+        # Paged KV stores V per page, so the leading dim is num_pages and the
+        # seqlen dim is page_size (each page holds a (d, page_size) block).
+        _v_lead = num_pages if page_table is not None else batch_size
+        _v_seq = page_size if page_table is not None else seqlen_k
+        assert v.shape[0] == _v_lead and v.shape[3] * 2 == _v_seq, (
+            f"FP4 V shape {v.shape} must be ({_v_lead}, h, d, {_v_seq // 2})"
         )
         num_head_kv = v.shape[1]
         head_dim_v = v.shape[2]
@@ -1623,6 +1638,8 @@ class FlashAttnFunc(torch.autograd.Function):
         mSFV: Optional[torch.Tensor] = None,
         v_descale: Optional[torch.Tensor] = None,
         force_fp4_impl: bool = False,
+        page_table: Optional[torch.Tensor] = None,
+        seqused_k: Optional[torch.Tensor] = None,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1652,6 +1669,8 @@ class FlashAttnFunc(torch.autograd.Function):
             mSFV=mSFV,
             v_descale=v_descale,
             force_fp4_impl=force_fp4_impl,
+            page_table=page_table,
+            seqused_k=seqused_k,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1674,7 +1693,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.softcap,
         )
-        return dq, dk, dv, *((None,) * 21)  # Extra Nones is fine
+        return dq, dk, dv, *((None,) * 23)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1767,7 +1786,16 @@ def flash_attn_func(
     mSFV: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     force_fp4_impl: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
 ):
+    """Paged KV (sglang/flashinfer convention): pass ``page_table`` of shape
+    ``(batch, max_num_pages_per_seq)`` int32, with ``k``/``v`` stored as
+    ``(num_pages, page_size, num_kv_heads, head_dim)`` (NHD). For block-scaled
+    NVFP4/MXFP8 inputs the scale-factor tensors ``mSFK``/``mSFV`` are paged the
+    same way (num_pages as the leading/batch dim) and ``page_size`` must be 128.
+    ``seqused_k`` gives the per-sequence KV length when pages are partly filled.
+    """
     return FlashAttnFunc.apply(
         q,
         k,
@@ -1789,6 +1817,8 @@ def flash_attn_func(
         mSFV,
         v_descale,
         force_fp4_impl,
+        page_table,
+        seqused_k,
     )
 
 

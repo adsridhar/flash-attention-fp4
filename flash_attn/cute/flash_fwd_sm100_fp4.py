@@ -4855,7 +4855,9 @@ class FlashAttentionForwardSm100:
             if const_expr(page_idx is None):
                 tXgSF_cur = tXgSF[None, block]
             else:
-                tXgSF_cur = tXgSF[None, page_idx]
+                # Paged: gSFK/gSFV were tiled with an extra page mode, so the
+                # coord is rank-3 exactly like the K/V data path above.
+                tXgSF_cur = tXgSF[None, 0, page_idx]
             cute.copy(tma_atom_sf, tXgSF_cur, tXsSF_cur, tma_bar_ptr=mbar_full_ptr + stage)
 
     def mainloop_s2t_copy_and_partition(
