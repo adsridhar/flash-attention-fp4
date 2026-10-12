@@ -258,6 +258,10 @@ class FlashAttentionForwardSm100:
         #   MXFP8+BF16 (1,32768,12,128): inline 1643 TF, generic 1650 TF (tie)
         # Mixed results; keep default generic, toggleable for per-shape tuning.
         self.debug_mxfp8_use_inline_ptx = os.getenv("FA4_MXFP8_USE_INLINE_PTX", "0") == "1"
+        # Compile-time online-softmax control for FP8 PV only.
+        self.fp8_pv_rescale_threshold = float(os.getenv("FA4_FP8_PV_RESCALE_THRESHOLD", "8.0"))
+        if not math.isfinite(self.fp8_pv_rescale_threshold) or self.fp8_pv_rescale_threshold < 0:
+            raise ValueError("FA4_FP8_PV_RESCALE_THRESHOLD must be finite and nonnegative")
         self.fp8_pv_use_explicit_pack = os.getenv("FA4_FP8_PV_USE_EXPLICIT_PACK", "1") == "1"
         # e2e (exp2 emulation) interleaving config — env vars read here,
         # applied in __call__ where v_dtype/quant_pv are known.
@@ -1280,6 +1284,9 @@ class FlashAttentionForwardSm100:
         """
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        cute.experimental.iket.mark("kernel_start", warp_idx)
+
         # Prefetch tma descriptor
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_Q)
@@ -1302,6 +1309,13 @@ class FlashAttentionForwardSm100:
 
         mbar_ptr = storage.mbar_ptr.data_ptr()
         # Use the first N warps to initialize barriers
+        # IKET role envelopes. The nested load/MMA/softmax/correction/store
+        # ranges expose each per-tile handoff; the warp-id payload separates
+        # the specialized roles. Full Cosmos KV lengths generate large traces,
+        # so use a short KV length first when inspecting the schedule.
+        # Detailed ranges use start_payload=Q block and end_payload=KV block;
+        # 65535 means that the corresponding tile is unavailable/not relevant.
+        init_iket = cute.experimental.iket.range_start("kernel.init", warp_idx)
         if warp_idx == 1:
             # Init "full" barrier with number of producers, "empty" barrier with number of consumers
             for i in cutlass.range_constexpr(self.q_stage):
@@ -1372,6 +1386,8 @@ class FlashAttentionForwardSm100:
                     mbar_ptr + self.mbar_sfqk_load_offset + i,
                     cute.arch.WARP_SIZE * len(self.softmax0_warp_ids)
                 )
+
+        cute.experimental.iket.range_end(init_iket, warp_idx)
         # Relying on pipeline_kv constructor to call mbarrier_init_fence and sync
         pipeline_kv = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset)
 
@@ -1610,6 +1626,9 @@ class FlashAttentionForwardSm100:
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.load_warp_ids[0] and warp_idx <= self.load_warp_ids[-1]:
+            load_iket = cute.experimental.iket.range_start(
+                "pipeline.load_gmem_to_smem", warp_idx
+            )
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
             self.load(
                 thr_mma_qk,
@@ -1642,11 +1661,15 @@ class FlashAttentionForwardSm100:
                 sfv_smem_layout_staged,
                 sSFV,
             )
+            cute.experimental.iket.range_end(load_iket, warp_idx)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
+            mma_iket = cute.experimental.iket.range_start(
+                "pipeline.mma_qk_pv", warp_idx
+            )
             # if warp_idx == self.mma_warp_id or warp_idx == self.empty_warp_ids:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
             # Alloc tmem buffer
@@ -1693,12 +1716,16 @@ class FlashAttentionForwardSm100:
                 ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
             )
             cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
+            cute.experimental.iket.range_end(mma_iket, warp_idx)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Epilogue
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(not self.use_correction_warps_for_epi):
             if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
+                store_iket = cute.experimental.iket.range_start(
+                    "pipeline.store_smem_to_gmem", warp_idx
+                )
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
                 self.epilogue_s2g(
                     mO,
@@ -1711,11 +1738,15 @@ class FlashAttentionForwardSm100:
                     SeqlenInfoCls,
                     TileSchedulerCls,
                 )
+                cute.experimental.iket.range_end(store_iket, warp_idx)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Softmax
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx < self.correction_warp_ids[0]:
+            softmax_iket = cute.experimental.iket.range_start(
+                "pipeline.softmax_and_p_convert", warp_idx
+            )
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
             softmax_loop = partial(
@@ -1764,11 +1795,15 @@ class FlashAttentionForwardSm100:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
                     softmax_loop(stage=1, tStSi=tStSi, tCtSFP=tCtSFPs[1])
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
+            cute.experimental.iket.range_end(softmax_iket, warp_idx)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
+            correction_iket = cute.experimental.iket.range_start(
+                "pipeline.correction_and_epilogue", warp_idx
+            )
             cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
             self.correction_loop(
                 thr_mma_qk,
@@ -1791,7 +1826,9 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors,
             )
             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
+            cute.experimental.iket.range_end(correction_iket, warp_idx)
 
+        cute.experimental.iket.mark("kernel_end", warp_idx)
         return
 
     @cute.jit
@@ -1988,6 +2025,7 @@ class FlashAttentionForwardSm100:
                 mbar_ptr + self.mbar_load_kv_full_offset,
                 mbar_ptr + self.mbar_load_kv_empty_offset,
                 K_or_V="K",
+                query_block=self.q_stage * m_block,
                 tma_atom_sf=tma_atom_sfk,
                 tXgSF=tKgSFK,
                 tXsSF=tKsSFK,
@@ -2003,6 +2041,7 @@ class FlashAttentionForwardSm100:
                 mbar_ptr + self.mbar_load_kv_full_offset,
                 mbar_ptr + self.mbar_load_kv_empty_offset,
                 K_or_V="V",
+                query_block=self.q_stage * m_block,
                 tma_atom_sf=tma_atom_sfv,
                 tXgSF=tVgSFV,
                 tXsSF=tVsSFV,
@@ -2247,9 +2286,19 @@ class FlashAttentionForwardSm100:
                     process_tile = n_block_min < n_block_max
 
             if process_tile:
+                query_pair_payload = Int32(self.q_stage * m_block)
+                first_kv_payload = (
+                    Int32(65535)
+                    if const_expr(self.use_block_sparsity)
+                    else Int32(n_block_max - 1)
+                )
                 for stage in cutlass.range_constexpr(self.q_stage):
+                    query_tile_payload = Int32(self.q_stage * m_block + stage)
                     # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
                     # 1. wait for Q0 / Q1
+                    qk_acquire_iket = cute.experimental.iket.range_start(
+                        "mma.qk_acquire", query_tile_payload
+                    )
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_load_q_full_offset + stage, mma_q_consumer_phase
                     )
@@ -2266,7 +2315,11 @@ class FlashAttentionForwardSm100:
                     # only tmem changes per q_stage.
                     if const_expr(self.quant_qk):
                         sm100_utils.tcgen05_after_thread_sync()
+                        wait_qk_scale_iket = cute.experimental.iket.range_start(
+                            "mma.wait_qk_scale", query_tile_payload
+                        )
                         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
+                        cute.experimental.iket.range_end(wait_qk_scale_iket, first_kv_payload)
                         _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
                         tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
                         if const_expr(not self.debug_skip_sfq_s2t):
@@ -2284,8 +2337,12 @@ class FlashAttentionForwardSm100:
                                 tCsSFK_compact_s2t_staged,
                                 tCtSFK_compact_s2t,
                             )
+                    cute.experimental.iket.range_end(qk_acquire_iket, first_kv_payload)
 
                     # 3. gemm
+                    qk_wgmma_iket = cute.experimental.iket.range_start(
+                        "mma.qk_wgmma", query_tile_payload
+                    )
                     # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
                     sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
                     if const_expr(self.uneven_kv_smem):
@@ -2301,6 +2358,7 @@ class FlashAttentionForwardSm100:
                     # 4. release S0 / S1
                     with cute.arch.elect_one():
                         tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
+                    cute.experimental.iket.range_end(qk_wgmma_iket, first_kv_payload)
                 mma_q_consumer_phase ^= 1
                 if const_expr(self.quant_qk):
                     mma_sfqk_producer_phase ^= 1
@@ -2315,17 +2373,35 @@ class FlashAttentionForwardSm100:
                 block_loop_count = block_iter_count - 1
                 O_should_accumulate = False
                 for i in cutlass.range(block_loop_count, unroll=1):
+                    pv_kv_payload = (
+                        Int32(65535)
+                        if const_expr(self.use_block_sparsity)
+                        else Int32(n_block_max - 1 - i)
+                    )
+                    next_qk_kv_payload = (
+                        Int32(65535)
+                        if const_expr(self.use_block_sparsity)
+                        else Int32(n_block_max - 2 - i)
+                    )
                     # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                     # 1. wait for V0
+                    wait_kv_iket = cute.experimental.iket.range_start(
+                        "mma.wait_kv", query_pair_payload
+                    )
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    cute.experimental.iket.range_end(wait_kv_iket, pv_kv_payload)
                     mma_kv_release_state = mma_kv_consumer_state.clone()
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tOrVi = tOrV[None, None, None, Vi_index]
                     for stage in cutlass.range_constexpr(self.q_stage):
+                        query_tile_payload = Int32(self.q_stage * m_block + stage)
                         # 2. acquire corrected O0/O1_partial and P0 / P1
                         # For the first iteration in this work tile, waiting for O0/O1_partial
                         # means that the correction warps has finished reading tO during
                         # the last iteration of the previous work tile has finished.
+                        pv_acquire_iket = cute.experimental.iket.range_start(
+                            "mma.pv_acquire", query_tile_payload
+                        )
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
                             P_full_O_rescaled_phase,
@@ -2352,11 +2428,15 @@ class FlashAttentionForwardSm100:
                                 tCsSFV_compact_s2t_staged,
                                 tCtSFV_compact_s2t,
                             )
+                        cute.experimental.iket.range_end(pv_acquire_iket, pv_kv_payload)
 
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
 
+                        pv_wgmma_iket = cute.experimental.iket.range_start(
+                            "mma.pv_wgmma", query_tile_payload
+                        )
                         gemm_Pi[stage](
                             tCrB=tOrVi,
                             sB=sV_cur,
@@ -2364,6 +2444,7 @@ class FlashAttentionForwardSm100:
                             mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
                             mbar_phase=P_full_O_rescaled_phase,
                         )
+                        cute.experimental.iket.range_end(pv_wgmma_iket, pv_kv_payload)
 
                         # 4. release accumulated O0_partial / O1_partial
                         # Don't need to signal O_full to the correction warps anymore since the
@@ -2380,6 +2461,9 @@ class FlashAttentionForwardSm100:
 
                         # GEMM_QK0i (Q0 * Ki -> S0)
                         # 1. wait for Ki
+                        qk_acquire_iket = cute.experimental.iket.range_start(
+                            "mma.qk_acquire", query_tile_payload
+                        )
                         if const_expr(stage == 0):
                             mma_kv_consumer_state.advance()
                             pipeline_kv.consumer_wait(mma_kv_consumer_state)
@@ -2394,7 +2478,11 @@ class FlashAttentionForwardSm100:
                             _, _, tCtSFQ_compact_s2t = tiled_copy_s2t_sfq_staged[stage]
                             tCsSFQ_compact_s2t_staged = tCsSFQ_compact_s2t[None, None, None, None, stage]
                             sm100_utils.tcgen05_after_thread_sync()
+                            wait_qk_scale_iket = cute.experimental.iket.range_start(
+                                "mma.wait_qk_scale", query_tile_payload
+                            )
                             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_sfqk_load_offset + stage, mma_sfqk_producer_phase)
+                            cute.experimental.iket.range_end(wait_qk_scale_iket, next_qk_kv_payload)
                             if const_expr(not self.debug_skip_sfq_s2t):
                                 cute.copy(
                                     tiled_copy_s2t_sfq,
@@ -2409,11 +2497,15 @@ class FlashAttentionForwardSm100:
                                     tCsSFK_compact_s2t_staged,
                                     tCtSFK_compact_s2t,
                                 )
+                        cute.experimental.iket.range_end(qk_acquire_iket, next_qk_kv_payload)
 
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
 
+                        qk_wgmma_iket = cute.experimental.iket.range_start(
+                            "mma.qk_wgmma", query_tile_payload
+                        )
                         gemm_Si[stage](
                             tCrB=tSrK[None, None, None, Ki_index],  # tCrB
                             sB=sK_cur,  # sB
@@ -2421,6 +2513,7 @@ class FlashAttentionForwardSm100:
                         # 3. release S0
                         with cute.arch.elect_one():
                             tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
+                        cute.experimental.iket.range_end(qk_wgmma_iket, next_qk_kv_payload)
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
                     # 4. release Ki
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
@@ -2438,11 +2531,24 @@ class FlashAttentionForwardSm100:
 
                 # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                 # 1. wait for V0
+                final_kv_payload = (
+                    Int32(65535)
+                    if const_expr(self.use_block_sparsity)
+                    else Int32(n_block_min)
+                )
+                wait_kv_iket = cute.experimental.iket.range_start(
+                    "mma.wait_kv", query_pair_payload
+                )
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                cute.experimental.iket.range_end(wait_kv_iket, final_kv_payload)
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                 tOrVi = tOrV[None, None, None, Vi_index]
                 for stage in cutlass.range_constexpr(self.q_stage):
+                    query_tile_payload = Int32(self.q_stage * m_block + stage)
                     # 2. acquire corrected Oi_partial and Pi
+                    pv_acquire_iket = cute.experimental.iket.range_start(
+                        "mma.pv_acquire", query_tile_payload
+                    )
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage, P_full_O_rescaled_phase
                     )
@@ -2467,10 +2573,14 @@ class FlashAttentionForwardSm100:
                             tCsSFV_compact_s2t_staged,
                             tCtSFV_compact_s2t,
                         )
+                    cute.experimental.iket.range_end(pv_acquire_iket, final_kv_payload)
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                     _zi_post = not O_should_accumulate
+                    pv_wgmma_iket = cute.experimental.iket.range_start(
+                        "mma.pv_wgmma", query_tile_payload
+                    )
                     gemm_Pi[stage](
                         tCrB=tOrVi,
                         sB=sV_cur,
@@ -2478,6 +2588,7 @@ class FlashAttentionForwardSm100:
                         mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
                         mbar_phase=P_full_O_rescaled_phase,
                     )
+                    cute.experimental.iket.range_end(pv_wgmma_iket, final_kv_payload)
                     # 4. release accumulated O0_partial
                     # We do need O_full here since for the last tile, by the time the softmax warp
                     # has signaled to the correction warps, the softmax warp has just finished compute
@@ -2634,7 +2745,7 @@ class FlashAttentionForwardSm100:
             elif const_expr(not self.quant_pv and self.v_dtype.width == 8):
                 # FP8 PV: use max_offset to shift P range for better utilization.
                 _max_offset = float(os.getenv("FA4_FP8_PV_P_LOG2_OFFSET", "0.0" if self.head_dim_v_padded <= 64 else "8.0"))
-                _rescale_threshold = 8.0
+                _rescale_threshold = self.fp8_pv_rescale_threshold
             else:
                 _max_offset = 0
                 _rescale_threshold = 8.0
@@ -2958,7 +3069,17 @@ class FlashAttentionForwardSm100:
         # P size when in FP32
         tScP = cute.composition(tScS, cute.make_layout((self.m_block_size, tilePlikeFP32)))
 
-        # Wait for Si
+        # IKET displays these as start_payload and end_payload. The softmax
+        # loop passes the stage-specific query block as m_block; n_block is
+        # the KV block. Both payloads must have the same integer width.
+        query_tile_payload = Int32(m_block)
+        kv_tile_payload = Int32(n_block)
+
+        # Wait for Si, copy it from TMEM to registers, then release the SFQ/SFK
+        # TMEM-copy hazard for the next QK operation.
+        acquire_scores_iket = cute.experimental.iket.range_start(
+            "softmax.acquire_scores", query_tile_payload
+        )
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
@@ -2967,7 +3088,11 @@ class FlashAttentionForwardSm100:
         cute.arch.fence_view_async_tmem_load()
         sfqk_stage = self.q_stage - 1 - stage
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_sfqk_load_offset + sfqk_stage)
+        cute.experimental.iket.range_end(acquire_scores_iket, kv_tile_payload)
 
+        rowmax_iket = cute.experimental.iket.range_start(
+            "softmax.rowmax", query_tile_payload
+        )
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
                 tSrS_t2r,
@@ -2998,7 +3123,11 @@ class FlashAttentionForwardSm100:
             sScale[thread_idx + stage * self.m_block_size] = acc_scale
         # Notify correction wg that row_max is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
+        cute.experimental.iket.range_end(rowmax_iket, kv_tile_payload)
 
+        exp_quantize_iket = cute.experimental.iket.range_start(
+            "softmax.exp_and_quantize_p", query_tile_payload
+        )
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
@@ -3085,6 +3214,11 @@ class FlashAttentionForwardSm100:
                     e2e_freq=self.e2e_freq,
                     e2e_start_frg=self.e2e_start_frg,
                 )
+        cute.experimental.iket.range_end(exp_quantize_iket, kv_tile_payload)
+
+        publish_p_iket = cute.experimental.iket.range_start(
+            "softmax.publish_p", query_tile_payload
+        )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
@@ -3098,12 +3232,20 @@ class FlashAttentionForwardSm100:
         cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that the 2nd half of P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+        cute.experimental.iket.range_end(publish_p_iket, kv_tile_payload)
+
+        wait_correction_iket = cute.experimental.iket.range_start(
+            "softmax.wait_correction", query_tile_payload
+        )
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )
+        cute.experimental.iket.range_end(wait_correction_iket, kv_tile_payload)
 
         if const_expr(not self.quant_pv):
+            sum_range = cute.experimental.iket.range_start("softmax.sum_weights", query_tile_payload)
             softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+            cute.experimental.iket.range_end(sum_range, kv_tile_payload)
         # acc_scale = cute.arch.exp2(acc_scale_)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
@@ -3190,8 +3332,17 @@ class FlashAttentionForwardSm100:
 
                 tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
                 for i in cutlass.range(total_block_count - 1, unroll=1):
+                    kv_tile_payload = (
+                        Int32(65535)
+                        if const_expr(self.use_block_sparsity)
+                        else Int32(n_block_max - 2 - i)
+                    )
                     for stage in cutlass.range_constexpr(self.q_stage):
+                        query_tile_payload = Int32(self.q_stage * m_block + stage)
                         # wait for S0 / S1
+                        wait_scale_iket = cute.experimental.iket.range_start(
+                            "correction.wait_scale", query_tile_payload
+                        )
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_softmax_corr_full_offset + stage,
                             softmax_corr_consumer_phase,
@@ -3201,17 +3352,29 @@ class FlashAttentionForwardSm100:
                         # scale = tSrScale_t2r[0]
                         scale = sScale[tidx + stage * self.m_block_size]
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
+                        cute.experimental.iket.range_end(wait_scale_iket, kv_tile_payload)
                         # Don't need O_full anymore, since by the time softmax has signaled the correction
                         # warps, S_i must have been done, so O_i-1 must have been done as well.
                         # cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase)
+                        # Keep the range unconditional so IKET discovers it in
+                        # the tracker pass even when that pass happens to see
+                        # no row whose running maximum changed.
+                        rescale_o_iket = cute.experimental.iket.range_start(
+                            "correction.rescale_o", query_tile_payload
+                        )
                         if should_rescale:
                             self.correction_rescale(
                                 thr_mma_pv, tOtOs[stage if self.q_stage == 2 else 0], tidx, scale
                             )
+                        cute.experimental.iket.range_end(rescale_o_iket, kv_tile_payload)
+                        acknowledge_iket = cute.experimental.iket.range_start(
+                            "correction.acknowledge", query_tile_payload
+                        )
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
                         cute.arch.mbarrier_arrive(
                             mbar_ptr + self.mbar_softmax_corr_empty_offset + (1 - stage)
                         )
+                        cute.experimental.iket.range_end(acknowledge_iket, kv_tile_payload)
                     softmax_corr_consumer_phase ^= 1
                     # o_corr_consumer_phase ^= 1
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + 1)
@@ -3231,7 +3394,16 @@ class FlashAttentionForwardSm100:
                                 (self.q_stage * m_block + stage) * self.m_block_size + tidx
                             ) % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
                             learnable_sink_val[stage] = Float32(learnable_sink[q_head_idx])
+                final_kv_payload = (
+                    Int32(65535)
+                    if const_expr(self.use_block_sparsity)
+                    else Int32(n_block_min)
+                )
                 for stage in cutlass.range_constexpr(self.q_stage):
+                    query_tile_payload = Int32(self.q_stage * m_block + stage)
+                    wait_final_o_iket = cute.experimental.iket.range_start(
+                        "correction.wait_final_o", query_tile_payload
+                    )
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_softmax_corr_full_offset + stage,
                         softmax_corr_consumer_phase,
@@ -3267,6 +3439,11 @@ class FlashAttentionForwardSm100:
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_corr_epi_empty_offset + stage, corr_epi_producer_phase
                         )
+                    cute.experimental.iket.range_end(wait_final_o_iket, final_kv_payload)
+
+                    normalize_o_iket = cute.experimental.iket.range_start(
+                        "correction.normalize_and_stage_o", query_tile_payload
+                    )
                     self.correction_epilogue(
                         thr_mma_pv,
                         tOtOs[stage],
@@ -3282,6 +3459,7 @@ class FlashAttentionForwardSm100:
                     )
                     if const_expr(not self.use_correction_warps_for_epi):
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_full_offset + stage)
+                    cute.experimental.iket.range_end(normalize_o_iket, final_kv_payload)
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
@@ -3515,10 +3693,9 @@ class FlashAttentionForwardSm100:
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
             cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
         # fence view async shared
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        # CUTLASS DSL 4.6 takes string-valued proxy and scope names; the
+        # ProxyKind/SharedSpace enums used by 4.5 are no longer public.
+        cute.arch.fence_proxy("async.shared", space="cta")
         if const_expr(self.use_correction_warps_for_epi):
             assert(not self.use_tma_O)
             assert(gmem_tiled_copy_O is not None)
@@ -3648,14 +3825,24 @@ class FlashAttentionForwardSm100:
                         tma_atom_O, 0, cute.make_layout(1), sO, gO
                     )
                     for stage in cutlass.range_constexpr(self.q_stage):
+                        query_tile_payload = Int32(self.q_stage * m_block + stage)
+                        no_kv_tile_payload = Int32(65535)
                         # wait from corr, issue tma store on smem
                         # 1. wait for O0 / O1 final
+                        wait_output_iket = cute.experimental.iket.range_start(
+                            "store.wait_output", query_tile_payload
+                        )
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_corr_epi_full_offset + stage, epi_consumer_phase
                         )
+                        cute.experimental.iket.range_end(wait_output_iket, no_kv_tile_payload)
                         # 2. copy O0 / O1 to gmem
+                        issue_gmem_iket = cute.experimental.iket.range_start(
+                            "store.issue_gmem", query_tile_payload
+                        )
                         store_O(src_idx=stage, dst_idx=self.q_stage * m_block + stage)
                         cute.arch.cp_async_bulk_commit_group()
+                        cute.experimental.iket.range_end(issue_gmem_iket, no_kv_tile_payload)
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # Ensure O0 / O1 buffer is ready to be released
                         cute.arch.cp_async_bulk_wait_group(1 - stage, read=True)
@@ -3680,12 +3867,21 @@ class FlashAttentionForwardSm100:
                         self.qhead_per_kvhead,
                     )
                     for stage in cutlass.range_constexpr(self.q_stage):
+                        query_tile_payload = Int32(self.q_stage * m_block + stage)
+                        no_kv_tile_payload = Int32(65535)
                         # wait from corr, issue tma store on smem
                         # 1. wait for O0 / O1 final
+                        wait_output_iket = cute.experimental.iket.range_start(
+                            "store.wait_output", query_tile_payload
+                        )
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_corr_epi_full_offset + stage, epi_consumer_phase
                         )
+                        cute.experimental.iket.range_end(wait_output_iket, no_kv_tile_payload)
                         # 2. copy O0 / O1 to gmem
+                        issue_gmem_iket = cute.experimental.iket.range_start(
+                            "store.issue_gmem", query_tile_payload
+                        )
                         # load acc O from smem to rmem for wider vectorization
                         tOrO = cute.make_fragment_like(tOsO[None, None, None, 0], self.o_dtype)
                         cute.autovec_copy(tOsO[None, None, None, stage], tOrO)
@@ -3716,6 +3912,7 @@ class FlashAttentionForwardSm100:
                                 seqlen.seqlen_q,
                             )
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_empty_offset + stage)
+                        cute.experimental.iket.range_end(issue_gmem_iket, no_kv_tile_payload)
 
                 epi_consumer_phase ^= 1
 
@@ -3733,7 +3930,17 @@ class FlashAttentionForwardSm100:
         phase: Int32,
         load_SFQ_fn: Optional[Callable] = None,
     ):
+        query_tile_payload = Int32(block)
+        no_kv_tile_payload = Int32(65535)
+        wait_empty_iket = cute.experimental.iket.range_start(
+            "load.q.wait_empty", query_tile_payload
+        )
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
+        cute.experimental.iket.range_end(wait_empty_iket, no_kv_tile_payload)
+
+        issue_tma_iket = cute.experimental.iket.range_start(
+            "load.q.issue_tma", query_tile_payload
+        )
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(mbar_full_ptr + stage, self.tma_copy_bytes["Q"])
         load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=mbar_full_ptr + stage)
@@ -3741,6 +3948,7 @@ class FlashAttentionForwardSm100:
         # Load scale factor for Q if provided
         if const_expr(load_SFQ_fn is not None):
             load_SFQ_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=mbar_full_ptr + stage)
+        cute.experimental.iket.range_end(issue_tma_iket, no_kv_tile_payload)
 
     @cute.jit
     def load_KV(
@@ -3755,20 +3963,40 @@ class FlashAttentionForwardSm100:
         block: Int32,
         producer_state: cutlass.pipeline.PipelineState,
         K_or_V: Literal["K", "V"],
+        query_block: Int32,
         page_idx: Optional[Int32] = None,
         tma_atom_sf: Optional[cute.CopyAtom] = None,
         tXgSF: Optional[cute.Tensor] = None,
         tXsSF: Optional[cute.Tensor] = None,
     ):
         assert K_or_V in ("K", "V")
+        query_tile_payload = Int32(query_block)
+        kv_tile_payload = Int32(block)
         stage, phase = producer_state.index, producer_state.phase
+        if const_expr(K_or_V == "K"):
+            wait_empty_iket = cute.experimental.iket.range_start(
+                "load.k.wait_empty", query_tile_payload
+            )
+        else:
+            wait_empty_iket = cute.experimental.iket.range_start(
+                "load.v.wait_empty", query_tile_payload
+            )
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
             # Before this round, the smem location was occupied by V, which is smaller than
             # K. So we need to wait for the stage after that (stage 1) to be empty as well.
             if stage == 0:
                 cute.arch.mbarrier_wait(mbar_empty_ptr + 1, phase)
+        cute.experimental.iket.range_end(wait_empty_iket, kv_tile_payload)
 
+        if const_expr(K_or_V == "K"):
+            issue_tma_iket = cute.experimental.iket.range_start(
+                "load.k.issue_tma", query_tile_payload
+            )
+        else:
+            issue_tma_iket = cute.experimental.iket.range_start(
+                "load.v.issue_tma", query_tile_payload
+            )
         if const_expr(self.use_tma_KV):
             assert (
                 tXgX is not None and
@@ -3801,6 +4029,7 @@ class FlashAttentionForwardSm100:
             else:
                 tXgSF_cur = tXgSF[None, page_idx]
             cute.copy(tma_atom_sf, tXgSF_cur, tXsSF_cur, tma_bar_ptr=mbar_full_ptr + stage)
+        cute.experimental.iket.range_end(issue_tma_iket, kv_tile_payload)
 
     def mainloop_s2t_copy_and_partition(
         self,

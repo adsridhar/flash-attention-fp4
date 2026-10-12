@@ -23,9 +23,32 @@ def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
         return "tf32"
     if isinstance(op, tcgen05.mma.MmaI8Op):
         return "i8"
-    if isinstance(op, tcgen05.mma.MmaFP8Op):
+    # CUTLASS DSL 4.6 generalized the FP8 operator names to cover the full
+    # f8/f6/f4 instruction family.  Keep accepting the 4.5 names because this
+    # checkout is also used in the pinned 4.5 reproduction environment.
+    if isinstance(
+        op,
+        tuple(
+            cls
+            for cls in (
+                getattr(tcgen05.mma, "MmaFP8Op", None),
+                getattr(tcgen05.mma, "MmaF8F6F4Op", None),
+            )
+            if cls is not None
+        ),
+    ):
         return "f8f6f4"
-    if isinstance(op, tcgen05.mma.MmaMXF8Op):
+    if isinstance(
+        op,
+        tuple(
+            cls
+            for cls in (
+                getattr(tcgen05.mma, "MmaMXF8Op", None),
+                getattr(tcgen05.mma, "MmaMXF8F6F4Op", None),
+            )
+            if cls is not None
+        ),
+    ):
         return "mxf8f6f4"
     if isinstance(op, tcgen05.mma.MmaMXF4Op):
         return "mxf4"

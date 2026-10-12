@@ -53,6 +53,11 @@ class MXF8F6F4Format(IntEnum):
     E2M1 = 5
 
 
+class MXF4Format(IntEnum):
+    # Dedicated .kind::mxf4 / .kind::mxf4nvf4 encoding, not MXF8F6F4.
+    E2M1 = 1
+
+
 class MaxShift(IntEnum):
     NoShift = 0
     MaxShift8 = 1
@@ -192,14 +197,23 @@ def make_instr_desc_block_scaled(
     a_neg: ScaleIn = ScaleIn.One,
     b_neg: ScaleIn = ScaleIn.One,
     is_sparse: bool = False,
+    *,
+    dedicated_fp4: bool = False,
 ) -> int:
     """
     Build the 32-bit instruction descriptor for Blackwell block-scaled MMA.
     All matrix/accumulator/scale factor **types must be CUTLASS scalar classes**.
+    dedicated_fp4 selects .kind::mxf4 / .kind::mxf4nvf4; the default retains
+    the generic .kind::mxf8f6f4 encoding, including E2M1 = 5.
     """
     # --- encode element formats -------------------------------------------------
-    a_fmt = int(to_UMMA_format(a_type))
-    b_fmt = int(to_UMMA_format(b_type))
+    if dedicated_fp4:
+        if a_type is not cutlass.Float4E2M1FN or b_type is not cutlass.Float4E2M1FN:
+            raise TypeError("Dedicated FP4 MMA requires E2M1 A and B operands")
+        a_fmt = b_fmt = int(MXF4Format.E2M1)
+    else:
+        a_fmt = int(to_UMMA_format(a_type))
+        b_fmt = int(to_UMMA_format(b_type))
     sf_fmt = int(to_ScaleFormat(sf_type))
 
     # --- range checks on M/N -----------------------------------------------------
@@ -219,7 +233,8 @@ def make_instr_desc_block_scaled(
     desc |= (0                 & 0x3) << 4        # b_sf_id
     desc |= (0                 & 0x1) << 6        # reserved
     desc |= (a_fmt             & 0x7) << 7        # a_format
-    desc |= (b_fmt             & 0x7) << 10       # b_format
+    # Dedicated FP4 B-format occupies bits 10-11; bit 12 must remain zero.
+    desc |= (b_fmt & (0x3 if dedicated_fp4 else 0x7)) << 10  # b_format
     desc |= (int(a_neg)        & 0x1) << 13       # a_negate
     desc |= (int(b_neg)        & 0x1) << 14       # b_negate
     desc |= (int(a_major)      & 0x1) << 15       # a_major
@@ -246,6 +261,9 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
             op.shape_mnk[1],
             Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
             Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+            dedicated_fp4=isinstance(
+                op, (cute.nvgpu.tcgen05.mma.MmaMXF4Op, cute.nvgpu.tcgen05.mma.MmaMXF4NVF4Op)
+            ),
         )
     return make_instr_desc(
         op.a_dtype,

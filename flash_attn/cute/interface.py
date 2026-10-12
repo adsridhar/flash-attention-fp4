@@ -42,6 +42,15 @@ from flash_attn.cute import utils
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_fwd_sm100_fp4 import FlashAttentionForwardSm100 as FlashAttentionForwardSm100FP4
+from flash_attn.cute.flash_fwd_sm100_fp4_expcast import FlashAttentionForwardSm100 as FlashAttentionForwardSm100FP4ExpCast
+from flash_attn.cute.flash_fwd_sm100_fp4_expcast_correction_decode import FlashAttentionForwardSm100 as FlashAttentionForwardSm100FP4ExpCastCorrectionDecode
+from flash_attn.cute.flash_fwd_sm100_fp4_expcast_correction_decode_split import (
+    FlashAttentionForwardSm100 as FlashAttentionForwardSm100FP4ExpCastCorrectionDecodeSplit,
+)
+from flash_attn.cute.flash_fwd_sm100_fp4_q_mean import (
+    FlashAttentionForwardSm100 as FlashAttentionForwardSm100FP4QMean,
+    add_q_mean_correction,
+)
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -232,6 +241,7 @@ def _flash_attn_fwd(
     mSFK: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for K
     mSFV: Optional[Union[torch.Tensor, cute.Tensor]] = None,  # Scale factor for V
     force_fp4_impl: bool = False, # Test fp4 attn impl under bf16 precision w/o sf
+    fp4_q_mean_correction: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -245,6 +255,18 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
+    if fp4_q_mean_correction is not None:
+        if score_mod is not None or aux_tensors is not None:
+            raise ValueError(
+                "fp4_q_mean_correction cannot be combined with score_mod or aux_tensors"
+            )
+        if fp4_q_mean_correction.dtype != torch.float32:
+            raise ValueError("fp4_q_mean_correction must be FP32")
+        if not fp4_q_mean_correction.is_contiguous():
+            raise ValueError("fp4_q_mean_correction must be contiguous")
+        score_mod = add_q_mean_correction
+        aux_tensors = [fp4_q_mean_correction]
+
     # Handle CUTE tensors - use them directly, no conversion needed
     # Only make contiguous if they are torch tensors
     if not isinstance(q, cute.Tensor):
@@ -273,6 +295,16 @@ def _flash_attn_fwd(
         num_pages, page_size = None, None
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
+    if fp4_q_mean_correction is not None:
+        expected_correction_shape = (batch_size, num_head, seqlen_k)
+        if fp4_q_mean_correction.shape != expected_correction_shape:
+            raise ValueError(
+                "fp4_q_mean_correction shape "
+                f"{tuple(fp4_q_mean_correction.shape)} != "
+                f"{expected_correction_shape}"
+            )
+        if fp4_q_mean_correction.device != q.device:
+            raise ValueError("fp4_q_mean_correction must be on the Q device")
     # For FP4 V (float4_e2m1fn_x2), V is passed as the K-major (= S-major) FP4
     # tensor with shape (b, h, d, s/2): each int8 byte holds two seqlen-adjacent
     # FP4 values (high/low nibble), so the FP4 stride for S is 0.5 byte = 1
@@ -627,9 +659,19 @@ def _flash_attn_fwd(
         _key_v_dtype = v.element_type
     else:
         _key_v_dtype = torch2cute_dtype_map.get(v.dtype, cutlass.BFloat16)
+    p_encoding = os.getenv("FA4_FP8_PV_P_ENCODING", "standard")
+    if p_encoding not in ("standard", "expcast"):
+        raise ValueError("FA4_FP8_PV_P_ENCODING must be standard or expcast")
+    if p_encoding == "expcast" and fp4_q_mean_correction is not None:
+        raise ValueError("ExpCast kernel does not yet support Q-mean correction")
     compile_key = (
         dtype,
         _key_v_dtype,
+        # The FP8 threshold is compiled into both ordinary and Q-mean HAO kernels.
+        float(os.getenv("FA4_FP8_PV_RESCALE_THRESHOLD", "8.0"))
+        if (use_fp4 or mSFQ is not None or force_fp4_impl)
+        and _key_v_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+        else None,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
@@ -664,7 +706,20 @@ def _flash_attn_fwd(
         _key_sf_dtype,     # E4M3 (NVFP4) vs E8M0 (MXFP8) — was previously not in the
                            # key; both modes shared a slot and the second silently
                            # reused the kernel compiled for the first.
+        os.getenv("FA4_FP8_PV_EXPCAST_EARLY_PUBLISH", "0") == "1",
+        os.getenv("FA4_FP8_PV_EXPCAST_PROFILE_SPLIT", "0") == "1",
+        os.getenv("FA4_FP8_PV_EXPCAST_REMOVE_CLAMPS", "1") == "1",
+        os.getenv("FA4_FP8_PV_EXPCAST_PACKED_MAPPING", "1") == "1",
+        os.getenv("FA4_FP8_PV_EXPCAST_PACKED_CONVERSION", "1") == "1",
+        os.getenv("FA4_FP8_PV_EXPCAST_NATIVE_DECODE", "0") == "1",
+        os.getenv("FA4_FP8_PV_EXPCAST_STREAM_SUM", "0") == "1",
+        os.getenv("FA4_FP8_PV_EXPCAST_CORRECTION_DECODE", "0") == "1",
+        os.getenv("FA4_FP8_PV_EXPCAST_CORRECTION_DECODE_SPLIT", "0") == "1",
         local,
+        p_encoding,
+        float(os.getenv("FA4_FP8_PV_P_LOG2_OFFSET", "0" if head_dim_v <= 64 else "8")),
+        float(os.getenv("FA4_FP8_PV_EXPCAST_BETA", "-0.35")),
+        int(os.getenv("FA4_FP8_PV_EXPCAST_MAX_CODE", "126")),
     )
     fp4_qk = use_fp4 and not is_cute_q
     # FP4 V also needs the make_ptr path: dlpack reports half-headdim shape for
@@ -821,7 +876,16 @@ def _flash_attn_fwd(
                         f"Invalid dtype combination: ab_dtype={ab_dtype}, "
                         f"sf_dtype={sf_dtype}, sf_vec_size={sf_vec_size}"
                     )
-                fa_fwd = FlashAttentionForwardSm100FP4(
+                fp4_kernel = FlashAttentionForwardSm100FP4
+                if p_encoding == "expcast":
+                    fp4_kernel = FlashAttentionForwardSm100FP4ExpCast
+                    if os.getenv("FA4_FP8_PV_EXPCAST_CORRECTION_DECODE", "0") == "1":
+                        fp4_kernel = FlashAttentionForwardSm100FP4ExpCastCorrectionDecode
+                    if os.getenv("FA4_FP8_PV_EXPCAST_CORRECTION_DECODE_SPLIT", "0") == "1":
+                        fp4_kernel = FlashAttentionForwardSm100FP4ExpCastCorrectionDecodeSplit
+                if fp4_q_mean_correction is not None:
+                    fp4_kernel = FlashAttentionForwardSm100FP4QMean
+                fa_fwd = fp4_kernel(
                     head_dim,
                     head_dim_v,
                     qhead_per_kvhead=qhead_per_kvhead,
@@ -1732,6 +1796,40 @@ def flash_attn_func(
         mSFK,
         mSFV,
         force_fp4_impl,
+    )
+
+
+def flash_attn_func_q_mean(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_mean_correction: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    mSFQ: Optional[torch.Tensor] = None,
+    mSFK: Optional[torch.Tensor] = None,
+    mSFV: Optional[torch.Tensor] = None,
+):
+    """Inference-only FP4 attention with an exact global-Q-mean correction.
+
+    This intentionally bypasses ``FlashAttnFunc``: the prototype has no
+    backward implementation, and keeping it separate leaves the base API and
+    kernel path unchanged.
+    """
+    return _flash_attn_fwd(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        mSFQ=mSFQ,
+        mSFK=mSFK,
+        mSFV=mSFV,
+        fp4_q_mean_correction=q_mean_correction,
     )
 
 
